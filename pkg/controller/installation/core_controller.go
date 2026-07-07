@@ -1590,6 +1590,26 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		}
 	}
 
+	// Check whether the Typha Deployment rollout is complete before applying
+	// calico-node. This prevents the DaemonSet from rolling while Typha pods
+	// are still starting up, which can cause Felix connectivity failures.
+	typhaRolledOut := false
+	typhaDeployment := &appsv1.Deployment{}
+	typhaKey := types.NamespacedName{Name: common.TyphaDeploymentName, Namespace: common.CalicoNamespace}
+	if err := r.client.Get(ctx, typhaKey, typhaDeployment); err != nil {
+		if !apierrors.IsNotFound(err) {
+			r.status.SetDegraded(operatorv1.ResourceReadError, "Unable to read Typha Deployment", err, reqLogger)
+			return reconcile.Result{}, err
+		}
+		// Typha doesn't exist yet (first install) — allow calico-node to proceed.
+		typhaRolledOut = true
+	} else if typhaDeployment.Spec.Replicas != nil {
+		// Typha exists — only proceed with calico-node if all replicas are updated and available.
+		typhaRolledOut = typhaDeployment.Status.ObservedGeneration >= typhaDeployment.Generation &&
+			typhaDeployment.Status.UpdatedReplicas == *typhaDeployment.Spec.Replicas &&
+			typhaDeployment.Status.AvailableReplicas == *typhaDeployment.Spec.Replicas
+	}
+
 	// Build a configuration for rendering calico/node.
 	nodeCfg := render.NodeConfiguration{
 		GoldmaneRunning:               goldmaneRunning,
@@ -1614,6 +1634,7 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		FelixPrometheusMetricsEnabled: utils.IsFelixPrometheusMetricsEnabled(felixConfiguration),
 		FelixPrometheusMetricsPort:    felixPrometheusMetricsPort,
 		V3CRDs:                        r.v3CRDs,
+		TyphaRolledOut:                typhaRolledOut,
 	}
 
 	if bgpConfiguration.Spec.BindMode != nil {
