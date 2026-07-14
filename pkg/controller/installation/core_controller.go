@@ -1676,10 +1676,13 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 	}
 
 	// Now check if calico-node is fully rolled out. If not, gate Typha.
+	// Read the DaemonSet directly from the API server rather than the
+	// informer cache: immediately after the update above, the cache can
+	// still hold the pre-update object whose status reports fully rolled
+	// out, which would open the gate before the rollout has even started.
 	nodeRolledOut := true
-	nodeDS := &appsv1.DaemonSet{}
-	nodeKey := types.NamespacedName{Name: common.NodeDaemonSetName, Namespace: common.CalicoNamespace}
-	if err := r.client.Get(ctx, nodeKey, nodeDS); err != nil {
+	nodeDS, err := r.clientset.AppsV1().DaemonSets(common.CalicoNamespace).Get(ctx, common.NodeDaemonSetName, metav1.GetOptions{})
+	if err != nil {
 		if !apierrors.IsNotFound(err) {
 			r.status.SetDegraded(operatorv1.ResourceReadError, "Unable to read calico-node DaemonSet", err, reqLogger)
 			return reconcile.Result{}, err
