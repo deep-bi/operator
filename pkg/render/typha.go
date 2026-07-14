@@ -87,9 +87,9 @@ type TyphaConfiguration struct {
 	FelixHealthPort int
 
 	// NodeRolledOut indicates whether the calico-node DaemonSet rollout is
-	// complete. Typha is gated on this to ensure calico-node rolls first
-	// during upgrades. New Felix (vN+1) is backward compatible with old
-	// Typha (vN), but old Felix (vN) cannot sync with new Typha (vN+1).
+	// complete. Typha is not updated until it is, so that calico-node rolls
+	// out first during upgrades: per the Calico version skew policy, Felix
+	// may be newer than Typha, but not older.
 	NodeRolledOut bool
 }
 

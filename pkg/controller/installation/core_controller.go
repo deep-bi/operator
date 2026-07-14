@@ -1538,7 +1538,6 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		}
 	}
 
-	// Typha is gated on calico-node below — just save the component for now.
 	components = append(components, typhaComponent)
 
 	// Build a configuration for rendering calico/node.
@@ -1660,12 +1659,13 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		return reconcile.Result{}, err
 	}
 
-	// Apply calico-node separately first so we can check its rollout status
-	// before applying Typha. During upgrades, calico-node must roll first
-	// because new Felix (vN+1) is backward compatible with old Typha (vN),
-	// but old Felix (vN) cannot sync with new Typha (vN+1). If Typha rolls
-	// first, old Felix reports 503, pods go NotReady after 90s, and the
-	// DaemonSet controller bypasses maxSurge limits.
+	// Apply calico-node before the remaining components so that its rollout
+	// status can be checked before Typha is applied. Per the Calico version
+	// skew policy, Felix may be at most one minor version ahead of Typha, but
+	// not behind it. Updating Typha while older calico-node pods are still
+	// running would leave those pods unable to sync, marking them NotReady
+	// and allowing the DaemonSet controller to exceed the configured surge
+	// limits when replacing them.
 	if err = imageset.ResolveImages(imageSet, nodeComponent); err != nil {
 		r.status.SetDegraded(operatorv1.ResourceValidationError, "Error resolving ImageSet for calico-node", err, reqLogger)
 		return reconcile.Result{}, err
@@ -1675,11 +1675,12 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		return reconcile.Result{}, err
 	}
 
-	// Now check if calico-node is fully rolled out. If not, gate Typha.
-	// Read the DaemonSet directly from the API server rather than the
-	// informer cache: immediately after the update above, the cache can
-	// still hold the pre-update object whose status reports fully rolled
-	// out, which would open the gate before the rollout has even started.
+	// Check whether the calico-node rollout is complete; Typha is only
+	// applied once it is. Read the DaemonSet directly from the API server
+	// rather than the informer cache: immediately after the update above,
+	// the cache may still hold the pre-update object whose status reports
+	// fully rolled out, which would open the gate before the rollout has
+	// started.
 	nodeRolledOut := true
 	nodeDS, err := r.clientset.AppsV1().DaemonSets(common.CalicoNamespace).Get(ctx, common.NodeDaemonSetName, metav1.GetOptions{})
 	if err != nil {
