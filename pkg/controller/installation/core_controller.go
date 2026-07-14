@@ -1593,30 +1593,6 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 			typhaDeployment.Status.AvailableReplicas == *typhaDeployment.Spec.Replicas
 	}
 
-	// Also check that all existing calico-node pods are Ready. After a Typha
-	// rollout, Felix needs time (~90s) to reconnect and resync. If we apply
-	// the calico-node DaemonSet update while pods are still NotReady from
-	// Felix 503, the DaemonSet controller bypasses maxSurge limits.
-	if typhaRolledOut {
-		nodeDS := &appsv1.DaemonSet{}
-		nodeKey := types.NamespacedName{Name: common.NodeDaemonSetName, Namespace: common.CalicoNamespace}
-		if err := r.client.Get(ctx, nodeKey, nodeDS); err != nil {
-			if !apierrors.IsNotFound(err) {
-				r.status.SetDegraded(operatorv1.ResourceReadError, "Unable to read calico-node DaemonSet", err, reqLogger)
-				return reconcile.Result{}, err
-			}
-			// DaemonSet doesn't exist yet (first install) — allow proceed.
-		} else if nodeDS.Status.DesiredNumberScheduled > 0 {
-			// Only proceed if all existing calico-node pods are Ready.
-			if nodeDS.Status.NumberReady != nodeDS.Status.DesiredNumberScheduled {
-				reqLogger.Info("Waiting for calico-node pods to be Ready after Typha rollout",
-					"ready", nodeDS.Status.NumberReady,
-					"desired", nodeDS.Status.DesiredNumberScheduled)
-				typhaRolledOut = false
-			}
-		}
-	}
-
 	// Build a configuration for rendering calico/node.
 	nodeCfg := render.NodeConfiguration{
 		GoldmaneRunning:               goldmaneRunning,
