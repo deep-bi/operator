@@ -1428,7 +1428,7 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		NonClusterHost:         nonclusterhost,
 		FelixHealthPort:        *felixConfiguration.Spec.HealthPort,
 	}
-	components = append(components, render.Typha(&typhaCfg))
+	typhaComponent := render.Typha(&typhaCfg)
 
 	// See the section 'Use of Finalizers for graceful termination' at the top of this file for terminating details.
 	canRemoveCNI := false
@@ -1538,14 +1538,44 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		}
 	}
 
-	// Check whether the Typha Deployment rollout is complete AND all calico-node
-	// pods are Ready before applying calico-node updates. During a Typha rollout,
-	// Felix loses its Typha connection and reports 503 on its health endpoint.
-	// After 3 failed readiness probes (90s), old calico-node pods go NotReady.
-	// The DaemonSet controller then bypasses the maxSurge limit for "unavailable"
-	// pods, replacing all pods simultaneously and collapsing the BGP mesh.
-	// By waiting for both Typha to finish AND calico-node to be fully healthy,
-	// we ensure Felix has reconnected before the DaemonSet rollout begins.
+	// Apply Typha separately before calico-node so we can check its rollout
+	// status after the apply. This follows the same pattern used by other
+	// controllers (e.g., intrusiondetection, compliance) that apply a setUp
+	// component before the rest.
+	imageSet, err := imageset.GetImageSet(ctx, r.client, instance.Spec.Variant)
+	if err != nil {
+		r.status.SetDegraded(operatorv1.ResourceReadError, "Error getting ImageSet", err, reqLogger)
+		return reconcile.Result{}, err
+	}
+	if imageSet == nil {
+		nvis, err := imageset.DoesNonVariantImageSetExist(ctx, r.client, instance.Spec.Variant)
+		if err != nil {
+			r.status.SetDegraded(operatorv1.ResourceReadError, "Error checking for non-variant ImageSet", err, reqLogger)
+			return reconcile.Result{}, err
+		} else if nvis {
+			reqLogger.Info("An ImageSet exists for a different variant")
+		}
+	}
+	if err = imageset.ValidateImageSet(imageSet); err != nil {
+		r.status.SetDegraded(operatorv1.ResourceValidationError, "Error validating ImageSet", err, reqLogger)
+		return reconcile.Result{}, err
+	}
+	if err = imageset.ResolveImages(imageSet, typhaComponent); err != nil {
+		r.status.SetDegraded(operatorv1.ResourceValidationError, "Error resolving ImageSet for Typha", err, reqLogger)
+		return reconcile.Result{}, err
+	}
+	if err := handler.CreateOrUpdateOrDelete(ctx, typhaComponent, nil); err != nil {
+		r.status.SetDegraded(operatorv1.ResourceUpdateError, "Error creating / updating Typha", err, reqLogger)
+		return reconcile.Result{}, err
+	}
+
+	// Now that Typha has been applied, check whether its rollout is complete
+	// AND all calico-node pods are Ready before applying calico-node updates.
+	// During a Typha rollout, Felix loses its Typha connection and reports 503
+	// on its health endpoint. After 3 failed readiness probes (90s), old
+	// calico-node pods go NotReady. The DaemonSet controller then bypasses the
+	// maxSurge limit for "unavailable" pods, replacing all pods simultaneously
+	// and collapsing the BGP mesh.
 	typhaRolledOut := false
 	typhaDeployment := &appsv1.Deployment{}
 	typhaKey := types.NamespacedName{Name: common.TyphaDeploymentName, Namespace: common.CalicoNamespace}
@@ -1682,32 +1712,6 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		components = append(components,
 			kubecontrollers.NewCalicoKubeControllersPolicy(&kubeControllersCfg, calicoSystemDefaultDenyForCalicoSystem()),
 		)
-	}
-
-	imageSet, err := imageset.GetImageSet(ctx, r.client, instance.Spec.Variant)
-	if err != nil {
-		r.status.SetDegraded(operatorv1.ResourceReadError, "Error getting ImageSet", err, reqLogger)
-		return reconcile.Result{}, err
-	}
-
-	if imageSet == nil {
-		// There is no imageSet for the configured variant, but check to see if there are any
-		// ImageSets with a different variant so we can give the user some kind of indication
-		// to why an existing ImageSet is being ignored.
-		nvis, err := imageset.DoesNonVariantImageSetExist(ctx, r.client, instance.Spec.Variant)
-		if err != nil {
-			r.status.SetDegraded(operatorv1.ResourceReadError, "Error checking for non-variant ImageSet", err, reqLogger)
-			return reconcile.Result{}, err
-		} else {
-			if nvis {
-				reqLogger.Info("An ImageSet exists for a different variant")
-			}
-		}
-	}
-
-	if err = imageset.ValidateImageSet(imageSet); err != nil {
-		r.status.SetDegraded(operatorv1.ResourceValidationError, "Error validating ImageSet", err, reqLogger)
-		return reconcile.Result{}, err
 	}
 
 	if err = imageset.ResolveImages(imageSet, components...); err != nil {
