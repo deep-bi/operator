@@ -85,6 +85,12 @@ type TyphaConfiguration struct {
 	// The health port that Felix is bound to. We configure Typha to bind to the port
 	// that is one less.
 	FelixHealthPort int
+
+	// NodeRolledOut indicates whether the calico-node DaemonSet rollout is
+	// complete. Typha is gated on this to ensure calico-node rolls first
+	// during upgrades. New Felix (vN+1) is backward compatible with old
+	// Typha (vN), but old Felix (vN) cannot sync with new Typha (vN+1).
+	NodeRolledOut bool
 }
 
 // Typha creates the typha daemonset and other resources for the daemonset to operate normally.
@@ -172,7 +178,7 @@ func (c *typhaComponent) typhaPodDisruptionBudget() *policyv1.PodDisruptionBudge
 }
 
 func (c *typhaComponent) Ready() bool {
-	return true
+	return c.cfg.NodeRolledOut
 }
 
 // typhaServiceAccount creates the typha's service account.

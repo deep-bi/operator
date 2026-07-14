@@ -151,12 +151,6 @@ type NodeConfiguration struct {
 	FelixPrometheusMetricsPort int
 
 	V3CRDs bool
-
-	// TyphaRolledOut indicates that the Typha Deployment rollout is complete
-	// (all updated replicas are available). When false, the node component
-	// will report not ready so that the calico-node DaemonSet is not updated
-	// until Typha is fully available.
-	TyphaRolledOut bool
 }
 
 // Node creates the node daemonset and other resources for the daemonset to operate normally.
@@ -275,7 +269,7 @@ func (c *nodeComponent) Objects() ([]client.Object, []client.Object) {
 }
 
 func (c *nodeComponent) Ready() bool {
-	return c.cfg.TyphaRolledOut
+	return true
 }
 
 // CNIPluginFinalizedObjects returns a list of objects that use the CNIFinalizer that should be

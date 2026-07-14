@@ -1538,60 +1538,29 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		}
 	}
 
-	// Apply Typha separately before calico-node so we can check its rollout
-	// status after the apply. This follows the same pattern used by other
-	// controllers (e.g., intrusiondetection, compliance) that apply a setUp
-	// component before the rest.
-	imageSet, err := imageset.GetImageSet(ctx, r.client, instance.Spec.Variant)
-	if err != nil {
-		r.status.SetDegraded(operatorv1.ResourceReadError, "Error getting ImageSet", err, reqLogger)
-		return reconcile.Result{}, err
-	}
-	if imageSet == nil {
-		nvis, err := imageset.DoesNonVariantImageSetExist(ctx, r.client, instance.Spec.Variant)
-		if err != nil {
-			r.status.SetDegraded(operatorv1.ResourceReadError, "Error checking for non-variant ImageSet", err, reqLogger)
-			return reconcile.Result{}, err
-		} else if nvis {
-			reqLogger.Info("An ImageSet exists for a different variant")
-		}
-	}
-	if err = imageset.ValidateImageSet(imageSet); err != nil {
-		r.status.SetDegraded(operatorv1.ResourceValidationError, "Error validating ImageSet", err, reqLogger)
-		return reconcile.Result{}, err
-	}
-	if err = imageset.ResolveImages(imageSet, typhaComponent); err != nil {
-		r.status.SetDegraded(operatorv1.ResourceValidationError, "Error resolving ImageSet for Typha", err, reqLogger)
-		return reconcile.Result{}, err
-	}
-	if err := handler.CreateOrUpdateOrDelete(ctx, typhaComponent, nil); err != nil {
-		r.status.SetDegraded(operatorv1.ResourceUpdateError, "Error creating / updating Typha", err, reqLogger)
-		return reconcile.Result{}, err
-	}
-
-	// Now that Typha has been applied, check whether its rollout is complete
-	// AND all calico-node pods are Ready before applying calico-node updates.
-	// During a Typha rollout, Felix loses its Typha connection and reports 503
-	// on its health endpoint. After 3 failed readiness probes (90s), old
-	// calico-node pods go NotReady. The DaemonSet controller then bypasses the
-	// maxSurge limit for "unavailable" pods, replacing all pods simultaneously
-	// and collapsing the BGP mesh.
-	typhaRolledOut := false
-	typhaDeployment := &appsv1.Deployment{}
-	typhaKey := types.NamespacedName{Name: common.TyphaDeploymentName, Namespace: common.CalicoNamespace}
-	if err := r.client.Get(ctx, typhaKey, typhaDeployment); err != nil {
+	// Check whether the calico-node DaemonSet rollout is complete before
+	// applying Typha updates. During upgrades, calico-node must roll first
+	// because new Felix (vN+1) is backward compatible with old Typha (vN),
+	// but old Felix (vN) cannot sync with new Typha (vN+1). If Typha rolls
+	// first, old Felix loses its connection and reports 503, causing pods to
+	// go NotReady after 90s. The DaemonSet controller then bypasses maxSurge
+	// limits for "unavailable" pods, replacing all pods simultaneously.
+	nodeRolledOut := true
+	nodeDS := &appsv1.DaemonSet{}
+	nodeKey := types.NamespacedName{Name: common.NodeDaemonSetName, Namespace: common.CalicoNamespace}
+	if err := r.client.Get(ctx, nodeKey, nodeDS); err != nil {
 		if !apierrors.IsNotFound(err) {
-			r.status.SetDegraded(operatorv1.ResourceReadError, "Unable to read Typha Deployment", err, reqLogger)
+			r.status.SetDegraded(operatorv1.ResourceReadError, "Unable to read calico-node DaemonSet", err, reqLogger)
 			return reconcile.Result{}, err
 		}
-		// Typha doesn't exist yet (first install) — allow calico-node to proceed.
-		typhaRolledOut = true
-	} else if typhaDeployment.Spec.Replicas != nil {
-		// Typha exists — only proceed with calico-node if all replicas are updated and available.
-		typhaRolledOut = typhaDeployment.Status.ObservedGeneration >= typhaDeployment.Generation &&
-			typhaDeployment.Status.UpdatedReplicas == *typhaDeployment.Spec.Replicas &&
-			typhaDeployment.Status.AvailableReplicas == *typhaDeployment.Spec.Replicas
+		// DaemonSet doesn't exist yet (first install) — allow Typha to proceed.
+	} else {
+		nodeRolledOut = nodeDS.Status.ObservedGeneration >= nodeDS.Generation &&
+			nodeDS.Status.UpdatedNumberScheduled == nodeDS.Status.DesiredNumberScheduled &&
+			nodeDS.Status.NumberReady == nodeDS.Status.DesiredNumberScheduled
 	}
+	typhaCfg.NodeRolledOut = nodeRolledOut
+	components = append(components, typhaComponent)
 
 	// Build a configuration for rendering calico/node.
 	nodeCfg := render.NodeConfiguration{
@@ -1617,7 +1586,6 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		FelixPrometheusMetricsEnabled: utils.IsFelixPrometheusMetricsEnabled(felixConfiguration),
 		FelixPrometheusMetricsPort:    felixPrometheusMetricsPort,
 		V3CRDs:                        r.v3CRDs,
-		TyphaRolledOut:                typhaRolledOut,
 	}
 
 	if bgpConfiguration.Spec.BindMode != nil {
@@ -1688,6 +1656,29 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		components = append(components,
 			kubecontrollers.NewCalicoKubeControllersPolicy(&kubeControllersCfg, calicoSystemDefaultDenyForCalicoSystem()),
 		)
+	}
+
+	imageSet, err := imageset.GetImageSet(ctx, r.client, instance.Spec.Variant)
+	if err != nil {
+		r.status.SetDegraded(operatorv1.ResourceReadError, "Error getting ImageSet", err, reqLogger)
+		return reconcile.Result{}, err
+	}
+
+	if imageSet == nil {
+		nvis, err := imageset.DoesNonVariantImageSetExist(ctx, r.client, instance.Spec.Variant)
+		if err != nil {
+			r.status.SetDegraded(operatorv1.ResourceReadError, "Error checking for non-variant ImageSet", err, reqLogger)
+			return reconcile.Result{}, err
+		} else {
+			if nvis {
+				reqLogger.Info("An ImageSet exists for a different variant")
+			}
+		}
+	}
+
+	if err = imageset.ValidateImageSet(imageSet); err != nil {
+		r.status.SetDegraded(operatorv1.ResourceValidationError, "Error validating ImageSet", err, reqLogger)
+		return reconcile.Result{}, err
 	}
 
 	if err = imageset.ResolveImages(imageSet, components...); err != nil {
