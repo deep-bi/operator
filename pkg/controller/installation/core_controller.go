@@ -1538,28 +1538,7 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		}
 	}
 
-	// Check whether the calico-node DaemonSet rollout is complete before
-	// applying Typha updates. During upgrades, calico-node must roll first
-	// because new Felix (vN+1) is backward compatible with old Typha (vN),
-	// but old Felix (vN) cannot sync with new Typha (vN+1). If Typha rolls
-	// first, old Felix loses its connection and reports 503, causing pods to
-	// go NotReady after 90s. The DaemonSet controller then bypasses maxSurge
-	// limits for "unavailable" pods, replacing all pods simultaneously.
-	nodeRolledOut := true
-	nodeDS := &appsv1.DaemonSet{}
-	nodeKey := types.NamespacedName{Name: common.NodeDaemonSetName, Namespace: common.CalicoNamespace}
-	if err := r.client.Get(ctx, nodeKey, nodeDS); err != nil {
-		if !apierrors.IsNotFound(err) {
-			r.status.SetDegraded(operatorv1.ResourceReadError, "Unable to read calico-node DaemonSet", err, reqLogger)
-			return reconcile.Result{}, err
-		}
-		// DaemonSet doesn't exist yet (first install) — allow Typha to proceed.
-	} else {
-		nodeRolledOut = nodeDS.Status.ObservedGeneration >= nodeDS.Generation &&
-			nodeDS.Status.UpdatedNumberScheduled == nodeDS.Status.DesiredNumberScheduled &&
-			nodeDS.Status.NumberReady == nodeDS.Status.DesiredNumberScheduled
-	}
-	typhaCfg.NodeRolledOut = nodeRolledOut
+	// Typha is gated on calico-node below — just save the component for now.
 	components = append(components, typhaComponent)
 
 	// Build a configuration for rendering calico/node.
@@ -1620,7 +1599,7 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		warnOnce.Reset()
 	}
 
-	components = append(components, render.Node(&nodeCfg))
+	nodeComponent := render.Node(&nodeCfg)
 
 	csiCfg := render.CSIConfiguration{
 		Installation: &instance.Spec,
@@ -1680,6 +1659,37 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		r.status.SetDegraded(operatorv1.ResourceValidationError, "Error validating ImageSet", err, reqLogger)
 		return reconcile.Result{}, err
 	}
+
+	// Apply calico-node separately first so we can check its rollout status
+	// before applying Typha. During upgrades, calico-node must roll first
+	// because new Felix (vN+1) is backward compatible with old Typha (vN),
+	// but old Felix (vN) cannot sync with new Typha (vN+1). If Typha rolls
+	// first, old Felix reports 503, pods go NotReady after 90s, and the
+	// DaemonSet controller bypasses maxSurge limits.
+	if err = imageset.ResolveImages(imageSet, nodeComponent); err != nil {
+		r.status.SetDegraded(operatorv1.ResourceValidationError, "Error resolving ImageSet for calico-node", err, reqLogger)
+		return reconcile.Result{}, err
+	}
+	if err := handler.CreateOrUpdateOrDelete(ctx, nodeComponent, nil); err != nil {
+		r.status.SetDegraded(operatorv1.ResourceUpdateError, "Error creating / updating calico-node", err, reqLogger)
+		return reconcile.Result{}, err
+	}
+
+	// Now check if calico-node is fully rolled out. If not, gate Typha.
+	nodeRolledOut := true
+	nodeDS := &appsv1.DaemonSet{}
+	nodeKey := types.NamespacedName{Name: common.NodeDaemonSetName, Namespace: common.CalicoNamespace}
+	if err := r.client.Get(ctx, nodeKey, nodeDS); err != nil {
+		if !apierrors.IsNotFound(err) {
+			r.status.SetDegraded(operatorv1.ResourceReadError, "Unable to read calico-node DaemonSet", err, reqLogger)
+			return reconcile.Result{}, err
+		}
+	} else {
+		nodeRolledOut = nodeDS.Status.ObservedGeneration >= nodeDS.Generation &&
+			nodeDS.Status.UpdatedNumberScheduled == nodeDS.Status.DesiredNumberScheduled &&
+			nodeDS.Status.NumberReady == nodeDS.Status.DesiredNumberScheduled
+	}
+	typhaCfg.NodeRolledOut = nodeRolledOut
 
 	if err = imageset.ResolveImages(imageSet, components...); err != nil {
 		r.status.SetDegraded(operatorv1.ResourceValidationError, "Error resolving ImageSet for components", err, reqLogger)
