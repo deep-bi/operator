@@ -172,6 +172,18 @@ type nodeComponent struct {
 	nodeImage    string
 }
 
+// NodeImage returns the image used by the calico-node container for the given
+// installation, resolving through the ImageSet when one is present.
+func NodeImage(installation *operatorv1.InstallationSpec, is *operatorv1.ImageSet) (string, error) {
+	if installation.Variant == operatorv1.TigeraSecureEnterprise {
+		return components.GetReference(components.ComponentTigeraNode, installation.Registry, installation.ImagePath, installation.ImagePrefix, is)
+	}
+	if operatorv1.IsFIPSModeEnabled(installation.FIPSMode) {
+		return components.GetReference(components.ComponentCalicoNodeFIPS, installation.Registry, installation.ImagePath, installation.ImagePrefix, is)
+	}
+	return components.GetReference(components.ComponentCalicoNode, installation.Registry, installation.ImagePath, installation.ImagePrefix, is)
+}
+
 func (c *nodeComponent) ResolveImages(is *operatorv1.ImageSet) error {
 	reg := c.cfg.Installation.Registry
 	path := c.cfg.Installation.ImagePath
@@ -186,18 +198,16 @@ func (c *nodeComponent) ResolveImages(is *operatorv1.ImageSet) error {
 
 	if c.cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
 		c.cniImage = appendIfErr(components.GetReference(components.ComponentTigeraCNI, reg, path, prefix, is))
-		c.nodeImage = appendIfErr(components.GetReference(components.ComponentTigeraNode, reg, path, prefix, is))
 		c.flexvolImage = appendIfErr(components.GetReference(components.ComponentTigeraFlexVolume, reg, path, prefix, is))
 	} else {
 		c.flexvolImage = appendIfErr(components.GetReference(components.ComponentCalicoFlexVolume, reg, path, prefix, is))
 		if operatorv1.IsFIPSModeEnabled(c.cfg.Installation.FIPSMode) {
 			c.cniImage = appendIfErr(components.GetReference(components.ComponentCalicoCNIFIPS, reg, path, prefix, is))
-			c.nodeImage = appendIfErr(components.GetReference(components.ComponentCalicoNodeFIPS, reg, path, prefix, is))
 		} else {
 			c.cniImage = appendIfErr(components.GetReference(components.ComponentCalicoCNI, reg, path, prefix, is))
-			c.nodeImage = appendIfErr(components.GetReference(components.ComponentCalicoNode, reg, path, prefix, is))
 		}
 	}
+	c.nodeImage = appendIfErr(NodeImage(c.cfg.Installation, is))
 
 	if len(errMsgs) != 0 {
 		return fmt.Errorf("%s", strings.Join(errMsgs, ","))
